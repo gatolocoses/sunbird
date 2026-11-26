@@ -582,8 +582,16 @@ fn calls_in(image: &Image<'_>, start: usize, len: usize) -> Vec<(usize, usize)> 
       return Vec::new();
    };
    // A `call rel32` decoded at the wrong offset lands anywhere in `.text`, so
-   // its target must also open like a function.
+   // its target must also open like a function, and not sit inside one the
+   // unwind table bounds. Linux build 2233's TesterUpdates page holds such a
+   // false call into the middle of a function right before `ActionRow`.
    let entry = |target: usize| {
+      if image
+         .function_bounds(target)
+         .is_some_and(|(start, _)| start != target)
+      {
+         return false;
+      }
       image.is_function(target)
          || image.read(target, 1).is_some_and(|first| {
             matches!(

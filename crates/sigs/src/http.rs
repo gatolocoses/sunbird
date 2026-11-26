@@ -23,6 +23,15 @@ use crate::Found;
 /// host-file body.
 const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
 
+/// Size of the `TransportRequest` the runtime's send detour reads and edits,
+/// the layout of Windows `Discord.exe`. Linux build 2233 passes a larger one.
+pub const TRANSPORT_REQUEST_SIZE: usize = 0xF0;
+
+/// Size of the `Poll<Result<Response, Error>>` the runtime's poll detour
+/// mirrors, the layout of Windows `Discord.exe`. Linux build 2233 returns a
+/// larger one with other niche tags.
+pub const POLL_RESULT_SIZE: usize = 0x80;
+
 /// Located vtable slots and host allocator entry points for Desktop Phoenix's
 /// `libdiscord/crates/http` transport.
 #[derive(Debug, Clone)]
@@ -32,10 +41,14 @@ pub struct DesktopHttpTransport {
    pub send_slots:   Vec<usize>,
    /// Original `ReqwestTransport::send` function address.
    pub send_fn:      usize,
+   /// Bytes `send_fn` reaches into the request it is handed.
+   pub send_input:   usize,
    /// All `.rdata` vtable slots holding `SendFuture::poll`.
    pub poll_slots:   Vec<usize>,
    /// Original `SendFuture::poll` function address.
    pub poll_fn:      usize,
+   /// Bytes `poll_fn` writes through its hidden return pointer.
+   pub poll_output:  usize,
    /// Host's `__rust_alloc(size, align)` if located.
    pub host_alloc:   Option<usize>,
    /// Host's `__rust_dealloc(ptr, size, align)` if located.
@@ -60,6 +73,9 @@ impl DesktopHttpTransport {
       let (send_fn, send_end) = image
          .function_bounds(lea)
          .ok_or("ReqwestTransport::send has no unwind entry")?;
+      let send_input = image.read(send_fn, send_end - send_fn).map_or(0, |code| {
+         extent(&phoenix_hook::x86::arg_accesses(abi, code, send_fn, 1))
+      });
 
       // 2. Every `dyn Transport` vtable slot in `.rdata` pointing to `send_fn`.
       let send_slots = find_vtable_method_slots(image, send_fn, 1..=0x2000);
@@ -75,6 +91,12 @@ impl DesktopHttpTransport {
       if !poll_slots.contains(&direct_slot) {
          poll_slots.push(direct_slot);
       }
+      let poll_output = image
+         .function_bounds(poll_fn)
+         .and_then(|(start, end)| image.read(start, end - start).map(|code| (start, code)))
+         .map_or(0, |(start, code)| {
+            extent(&phoenix_hook::x86::sret_stores(abi, code, start))
+         });
 
       // 4. The host's own `__rust_alloc` and `__rust_dealloc`, so response body
       //    growth stays allocator-compatible. Both hand the same global allocator
@@ -95,12 +117,49 @@ impl DesktopHttpTransport {
       Ok(Self {
          send_slots,
          send_fn,
+         send_input,
          poll_slots,
          poll_fn,
+         poll_output,
          host_alloc,
          host_dealloc,
       })
    }
+
+   /// Whether `ReqwestTransport::send` takes the
+   /// [`TRANSPORT_REQUEST_SIZE`]-byte request the send detour reads and edits.
+   /// In a larger one its fields sit elsewhere, so requests stay unhooked.
+   pub fn send_fits(&self) -> Found<()> {
+      if self.send_input > TRANSPORT_REQUEST_SIZE {
+         return Err(format!(
+            "ReqwestTransport::send reads {:#x} bytes of {TRANSPORT_REQUEST_SIZE:#x}",
+            self.send_input
+         ));
+      }
+      Ok(())
+   }
+
+   /// Whether `SendFuture::poll` returns the [`POLL_RESULT_SIZE`]-byte result
+   /// the poll detour reads and copies. A larger one would overflow the
+   /// detour's copy on the stack, so response hooks stay off.
+   pub fn poll_fits(&self) -> Found<()> {
+      if self.poll_output > POLL_RESULT_SIZE {
+         return Err(format!(
+            "SendFuture::poll fills {:#x} bytes of {POLL_RESULT_SIZE:#x}",
+            self.poll_output
+         ));
+      }
+      Ok(())
+   }
+}
+
+/// The end of the furthest `(offset, size)` access, 0 when there is none.
+fn extent(accesses: &[(usize, usize)]) -> usize {
+   accesses
+      .iter()
+      .map(|&(field, len)| field + len)
+      .max()
+      .unwrap_or(0)
 }
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`

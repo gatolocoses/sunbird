@@ -330,6 +330,72 @@ pub fn sret_stores(abi: Abi, code: &[u8], ip: usize) -> Vec<(usize, usize)> {
    stores
 }
 
+/// The `(offset, size)` accesses a function makes through its `index`th
+/// integer argument, a pointer on entry, and the registers it is copied to.
+///
+/// Decoding stops at the first `ret` and follows control flow linearly, like
+/// [`sret_stores`]. The furthest access is a lower bound on the size of the
+/// struct the argument points to, so a layout baked into a detour can be
+/// checked against a new build.
+#[must_use]
+pub fn arg_accesses(abi: Abi, code: &[u8], ip: usize, index: usize) -> Vec<(usize, usize)> {
+   use iced_x86::{
+      Code,
+      InstructionInfoFactory,
+      Mnemonic,
+      OpAccess,
+      OpKind,
+   };
+
+   let writes = |access: OpAccess| {
+      matches!(
+         access,
+         OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+      )
+   };
+
+   let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
+   let mut factory = InstructionInfoFactory::new();
+   let mut holders = vec![abi.arg(index)];
+   let mut accesses = Vec::new();
+   while decoder.can_decode() {
+      let instruction = decoder.decode();
+      if instruction.is_invalid() || instruction.mnemonic() == Mnemonic::Ret {
+         break;
+      }
+      if instruction.mnemonic() == Mnemonic::Call {
+         holders.retain(|register| !abi.volatile().contains(register));
+         continue;
+      }
+      let info = factory.info(&instruction);
+      for memory in info.used_memory() {
+         if memory.access() != OpAccess::NoMemAccess
+            && holders.contains(&memory.base())
+            && memory.index() == Register::None
+         {
+            accesses.push((addr(memory.displacement()), memory.memory_size().size()));
+         }
+      }
+      let copied = matches!(instruction.code(), Code::Mov_r64_rm64 | Code::Mov_rm64_r64)
+         && instruction.op0_kind() == OpKind::Register
+         && instruction.op1_kind() == OpKind::Register
+         && holders.contains(&instruction.op1_register());
+      let written = info
+         .used_registers()
+         .iter()
+         .filter(|used| writes(used.access()))
+         .map(|used| used.register().full_register())
+         .collect::<Vec<_>>();
+      for register in written {
+         holders.retain(|&held| held != register);
+         if copied && register == instruction.op0_register() {
+            holders.push(register);
+         }
+      }
+   }
+   accesses
+}
+
 /// One `DebugStruct::field(name, &self.field)` call in a derived `Debug::fmt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DebugField {
@@ -429,7 +495,8 @@ pub fn debug_fields(abi: Abi, code: &[u8], ip: usize) -> Vec<DebugField> {
             }
          },
          (Mnemonic::Add, Some(_)) if to_this => {
-            // A register, a negative or an overflowing step loses track of `self`.
+            // A register, a negative or an overflowing step loses track of
+            // `self`.
             if let Some(sum) = ins
                .try_immediate(1)
                .ok()
@@ -944,6 +1011,24 @@ mod tests {
          (0x80, 8),
          (8, 8),
          (0, 0x40)
+      ]);
+   }
+
+   #[test]
+   fn arg_accesses_follow_the_argument() {
+      let code = [
+         0x48, 0x89, 0xF3, // mov rbx, rsi
+         0x8B, 0xAB, 0xD0, 0x00, 0x00, 0x00, // mov ebp, [rbx+0xd0]
+         0x48, 0x8D, 0x73, 0x58, // lea rsi, [rbx+0x58]: no access, and rsi no longer holds it
+         0x8B, 0x46, 0x10, // mov eax, [rsi+0x10]
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call: rbx survives it
+         0x40, 0x8A, 0xAB, 0x62, 0x01, 0x00, 0x00, // mov bpl, [rbx+0x162]
+         0xC3, // ret
+         0x8B, 0x43, 0x08, // mov eax, [rbx+8]: past the ret
+      ];
+      assert_eq!(arg_accesses(Abi::SysV, &code, 0x1000, 1), [
+         (0xD0, 4),
+         (0x162, 1)
       ]);
    }
 

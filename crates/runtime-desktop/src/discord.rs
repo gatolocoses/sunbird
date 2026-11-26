@@ -53,7 +53,11 @@ use phoenix_runtime::{
 };
 use phoenix_sigs::{
    desktop,
-   http::DesktopHttpTransport,
+   http::{
+      DesktopHttpTransport,
+      POLL_RESULT_SIZE,
+      TRANSPORT_REQUEST_SIZE,
+   },
 };
 
 /// Standard HTTP/1.x `http::header::StandardHeader` names in discriminant
@@ -220,7 +224,7 @@ struct RawTransportRequest {
    method:   RawMethod,
    _extra:   [u64; 3],
 }
-const _: () = assert!(size_of::<RawTransportRequest>() == 0xF0);
+const _: () = assert!(size_of::<RawTransportRequest>() == TRANSPORT_REQUEST_SIZE);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -236,7 +240,7 @@ struct RawPollResult {
    status:  u16,
    _pad:    [u8; 6],
 }
-const _: () = assert!(size_of::<RawPollResult>() == 0x80);
+const _: () = assert!(size_of::<RawPollResult>() == POLL_RESULT_SIZE);
 
 impl RawPollResult {
    const PENDING_TAG: u64 = u64::MAX - 1;
@@ -263,6 +267,8 @@ type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
 struct Installed {
    send:         SendFn,
    poll:         PollFn,
+   /// Whether the poll slots are swapped, so responses reach `poll_detour`.
+   responses:    bool,
    host_alloc:   Option<HostAllocFn>,
    host_dealloc: Option<HostDeallocFn>,
 }
@@ -383,6 +389,10 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
+   if let Err(err) = found.send_fits() {
+      log::warn!("discord desktop: HTTP send not hooked: {err}");
+      return;
+   }
    // Discord's API client calls `send` directly rather than through the
    // vtable, so `send` is hooked in place and the detour calls the trampoline.
    // It opens with the same register saves and `sub rsp` as a render frame.
@@ -403,11 +413,13 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
+   let responses = found.poll_fits();
    // SAFETY: `DesktopHttpTransport::locate` verified every target against
    // `.pdata`, and the trampoline replays `send`'s prologue.
    let installed = Installed {
       send:         unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
       poll:         unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
+      responses:    responses.is_ok(),
       host_alloc:   found
          .host_alloc
          .map(|addr| unsafe { std::mem::transmute::<usize, HostAllocFn>(addr) }),
@@ -416,6 +428,10 @@ pub fn install(image: &Image<'static>) {
          .map(|addr| unsafe { std::mem::transmute::<usize, HostDeallocFn>(addr) }),
    };
    if INSTALLED.set(installed).is_err() {
+      return;
+   }
+   if let Err(err) = responses {
+      log::warn!("discord desktop: hooked HTTP send, response hooks off: {err}");
       return;
    }
 
@@ -576,7 +592,9 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) ->
             },
          }
 
-         watched = watch_response(&method, &url);
+         if installed.responses {
+            watched = watch_response(&method, &url);
+         }
       }))
       .is_err()
    {

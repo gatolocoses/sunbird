@@ -128,11 +128,17 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "http transport",
             http.as_ref().map_err(Clone::clone).and_then(|http| {
-               http.send_fits()?;
+               let request = http.request.clone()?;
                prologues
                   .frame
                   .at(image, http.send_fn)
-                  .then(|| format!("{} (reads {:#x})", at(http.send_fn), http.send_input))
+                  .then(|| {
+                     format!(
+                        "{} (reads {:#x}, {request:x?})",
+                        at(http.send_fn),
+                        http.send_input
+                     )
+                  })
                   .ok_or_else(|| "send prologue changed".to_owned())
             }),
          );

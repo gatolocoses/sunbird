@@ -330,6 +330,78 @@ pub fn sret_stores(abi: Abi, code: &[u8], ip: usize) -> Vec<(usize, usize)> {
    stores
 }
 
+/// The registers holding a pointer argument, followed linearly from entry.
+struct ArgHolders {
+   holders: Vec<Register>,
+}
+
+impl ArgHolders {
+   fn new(abi: Abi, index: usize) -> Self {
+      Self {
+         holders: vec![abi.arg(index)],
+      }
+   }
+
+   fn holds(&self, register: Register) -> bool {
+      self.holders.contains(&register)
+   }
+
+   /// Drops the registers `instruction` overwrites, keeps a `mov` copy, and
+   /// forgets the volatile ones across a call.
+   fn after(&mut self, abi: Abi, instruction: &Instruction, written: &[Register]) {
+      use iced_x86::{
+         Code,
+         Mnemonic,
+         OpKind,
+      };
+      if instruction.mnemonic() == Mnemonic::Call {
+         self
+            .holders
+            .retain(|register| !abi.volatile().contains(register));
+         return;
+      }
+      let copied = matches!(instruction.code(), Code::Mov_r64_rm64 | Code::Mov_rm64_r64)
+         && instruction.op0_kind() == OpKind::Register
+         && instruction.op1_kind() == OpKind::Register
+         && self.holds(instruction.op1_register());
+      for &register in written {
+         self.holders.retain(|&held| held != register);
+         if copied && register == instruction.op0_register() {
+            self.holders.push(register);
+         }
+      }
+   }
+}
+
+/// The full registers `info`'s instruction writes.
+fn written_registers(info: &iced_x86::InstructionInfo) -> Vec<Register> {
+   use iced_x86::OpAccess;
+   info
+      .used_registers()
+      .iter()
+      .filter(|used| {
+         matches!(
+            used.access(),
+            OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+         )
+      })
+      .map(|used| used.register().full_register())
+      .collect()
+}
+
+/// `[base + disp]` with no index, as `(base, disp)`.
+fn based(instruction: &Instruction, operand: u32) -> Option<(Register, usize)> {
+   (instruction.op_kind(operand) == iced_x86::OpKind::Memory
+      && instruction.memory_index() == Register::None
+      && !instruction.is_ip_rel_memory_operand())
+   .then(|| {
+      (
+         instruction.memory_base(),
+         addr(instruction.memory_displacement64()),
+      )
+   })
+}
+
 /// The `(offset, size)` accesses a function makes through its `index`th
 /// integer argument, a pointer on entry, and the registers it is copied to.
 ///
@@ -340,23 +412,14 @@ pub fn sret_stores(abi: Abi, code: &[u8], ip: usize) -> Vec<(usize, usize)> {
 #[must_use]
 pub fn arg_accesses(abi: Abi, code: &[u8], ip: usize, index: usize) -> Vec<(usize, usize)> {
    use iced_x86::{
-      Code,
       InstructionInfoFactory,
       Mnemonic,
       OpAccess,
-      OpKind,
-   };
-
-   let writes = |access: OpAccess| {
-      matches!(
-         access,
-         OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
-      )
    };
 
    let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
    let mut factory = InstructionInfoFactory::new();
-   let mut holders = vec![abi.arg(index)];
+   let mut holders = ArgHolders::new(abi, index);
    let mut accesses = Vec::new();
    while decoder.can_decode() {
       let instruction = decoder.decode();
@@ -364,36 +427,220 @@ pub fn arg_accesses(abi: Abi, code: &[u8], ip: usize, index: usize) -> Vec<(usiz
          break;
       }
       if instruction.mnemonic() == Mnemonic::Call {
-         holders.retain(|register| !abi.volatile().contains(register));
+         holders.after(abi, &instruction, &[]);
          continue;
       }
       let info = factory.info(&instruction);
       for memory in info.used_memory() {
          if memory.access() != OpAccess::NoMemAccess
-            && holders.contains(&memory.base())
+            && holders.holds(memory.base())
             && memory.index() == Register::None
          {
             accesses.push((addr(memory.displacement()), memory.memory_size().size()));
          }
       }
-      let copied = matches!(instruction.code(), Code::Mov_r64_rm64 | Code::Mov_rm64_r64)
-         && instruction.op0_kind() == OpKind::Register
-         && instruction.op1_kind() == OpKind::Register
-         && holders.contains(&instruction.op1_register());
-      let written = info
-         .used_registers()
-         .iter()
-         .filter(|used| writes(used.access()))
-         .map(|used| used.register().full_register())
-         .collect::<Vec<_>>();
-      for register in written {
-         holders.retain(|&held| held != register);
-         if copied && register == instruction.op0_register() {
-            holders.push(register);
-         }
-      }
+      holders.after(abi, &instruction, &written_registers(info));
    }
    accesses
+}
+
+/// `(offset, table)` for each `switch` on a field of a pointer argument.
+///
+/// The field is the struct's at `offset`, which the `index`th argument points
+/// to: `mov r, [arg + offset]`, `movsxd r, [table + r * 4]`, `add r, table`,
+/// `jmp r`, with `table` loaded by a RIP-relative `lea`. Each table entry is a
+/// target's distance from `table`.
+#[must_use]
+pub fn arg_jump_tables(abi: Abi, code: &[u8], ip: usize, index: usize) -> Vec<(usize, usize)> {
+   use std::collections::HashMap;
+
+   use iced_x86::{
+      InstructionInfoFactory,
+      Mnemonic,
+      OpKind,
+   };
+
+   let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
+   let mut factory = InstructionInfoFactory::new();
+   let mut holders = ArgHolders::new(abi, index);
+   let mut tables: HashMap<Register, usize> = HashMap::new();
+   // The register just loaded from a field, and the field.
+   let mut field: Option<(Register, usize)> = None;
+   // That register once indexed into a table: (register, table base, table).
+   let mut indexed: Option<(Register, Register, usize)> = None;
+   let mut added = false;
+   let mut found = Vec::new();
+   while decoder.can_decode() {
+      let ins = decoder.decode();
+      if ins.is_invalid() {
+         break;
+      }
+      let dst = (ins.op_count() > 0 && ins.op0_kind() == OpKind::Register)
+         .then(|| ins.op0_register().full_register());
+      match ins.mnemonic() {
+         Mnemonic::Jmp
+            if added
+               && ins.op0_kind() == OpKind::Register
+               && let Some((register, _, table)) = indexed
+               && let Some((_, offset)) = field
+               && ins.op0_register().full_register() == register =>
+         {
+            found.push((offset, table));
+         },
+         Mnemonic::Add
+            if let Some((register, base, _)) = indexed
+               && dst == Some(register)
+               && ins.op1_kind() == OpKind::Register
+               && ins.op1_register().full_register() == base =>
+         {
+            added = true;
+            let info = factory.info(&ins);
+            holders.after(abi, &ins, &written_registers(info));
+            continue;
+         },
+         Mnemonic::Movsxd
+            if let Some((register, _)) = field
+               && ins.op1_kind() == OpKind::Memory
+               && ins.memory_index().full_register() == register
+               && ins.memory_index_scale() == 4
+               && ins.memory_displacement64() == 0
+               && let Some(&table) = tables.get(&ins.memory_base())
+               && dst == Some(register) =>
+         {
+            indexed = Some((register, ins.memory_base(), table));
+            added = false;
+            let info = factory.info(&ins);
+            holders.after(abi, &ins, &written_registers(info));
+            continue;
+         },
+         _ => {},
+      }
+      indexed = None;
+      added = false;
+      field = None;
+      if ins.mnemonic() == Mnemonic::Mov
+         && ins.memory_size().size() == 8
+         && let Some(register) = dst
+         && let Some((base, offset)) = based(&ins, 1)
+         && holders.holds(base)
+      {
+         field = Some((register, offset));
+      }
+      let info = factory.info(&ins);
+      let written = written_registers(info);
+      for register in &written {
+         tables.remove(register);
+      }
+      if ins.mnemonic() == Mnemonic::Lea
+         && ins.is_ip_rel_memory_operand()
+         && let Some(register) = dst
+      {
+         tables.insert(register, addr(ins.ip_rel_memory_address()));
+      }
+      holders.after(abi, &ins, &written);
+   }
+   found
+}
+
+/// What a call's argument points to, in the struct another argument of the
+/// calling function points to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldArg {
+   /// `lea arg, [struct + offset]`: the field itself.
+   Field(usize),
+   /// A temporary whose first bytes were copied from the field at `offset`.
+   Copy(usize),
+}
+
+/// A call, and what its first four integer arguments point to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldCall {
+   pub site: usize,
+   pub args: [Option<FieldArg>; 4],
+}
+
+/// The calls a function makes with pointers into the struct its `index`th
+/// argument points to, or into temporaries copied from it, followed linearly.
+#[must_use]
+pub fn arg_field_calls(abi: Abi, code: &[u8], ip: usize, index: usize) -> Vec<FieldCall> {
+   use std::collections::HashMap;
+
+   use iced_x86::{
+      InstructionInfoFactory,
+      Mnemonic,
+      OpKind,
+   };
+
+   let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
+   let mut factory = InstructionInfoFactory::new();
+   let mut holders = ArgHolders::new(abi, index);
+   // Registers holding a field's value, by the field.
+   let mut loaded: HashMap<Register, usize> = HashMap::new();
+   // Registers pointing at a field, or at a temporary copied from one.
+   let mut points: HashMap<Register, Option<FieldArg>> = HashMap::new();
+   let mut calls = Vec::new();
+   while decoder.can_decode() {
+      let ins = decoder.decode();
+      if ins.is_invalid() {
+         break;
+      }
+      if ins.mnemonic() == Mnemonic::Call {
+         let args = std::array::from_fn(|at| points.get(&abi.arg(at)).copied().flatten());
+         if args.iter().any(Option::is_some) {
+            calls.push(FieldCall {
+               site: addr(ins.ip()),
+               args,
+            });
+         }
+         loaded.retain(|register, _| !abi.volatile().contains(register) && !register.is_zmm());
+         points.retain(|register, _| !abi.volatile().contains(register));
+         holders.after(abi, &ins, &[]);
+         continue;
+      }
+      let dst = (ins.op_count() > 0 && ins.op0_kind() == OpKind::Register)
+         .then(|| ins.op0_register().full_register());
+      // A field value stored at the start of what a register points to.
+      if matches!(
+         ins.mnemonic(),
+         Mnemonic::Mov | Mnemonic::Movups | Mnemonic::Movaps
+      ) && let Some((base, 0)) = based(&ins, 0)
+         && ins.op1_kind() == OpKind::Register
+         && let Some(&field) = loaded.get(&ins.op1_register().full_register())
+         && let Some(pointee) = points.get_mut(&base)
+         && pointee.is_none()
+      {
+         *pointee = Some(FieldArg::Copy(field));
+      }
+      let info = factory.info(&ins);
+      let written = written_registers(info);
+      for register in &written {
+         loaded.remove(register);
+         points.remove(register);
+      }
+      if let Some(register) = dst {
+         match ins.mnemonic() {
+            Mnemonic::Lea => {
+               if let Some((base, offset)) = based(&ins, 1) {
+                  if holders.holds(base) {
+                     points.insert(register, Some(FieldArg::Field(offset)));
+                  } else if base == Register::RSP {
+                     points.insert(register, None);
+                  }
+               }
+            },
+            Mnemonic::Mov | Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu => {
+               if let Some((base, offset)) = based(&ins, 1)
+                  && holders.holds(base)
+               {
+                  loaded.insert(register, offset);
+               }
+            },
+            _ => {},
+         }
+      }
+      holders.after(abi, &ins, &written);
+   }
+   calls
 }
 
 /// One `DebugStruct::field(name, &self.field)` call in a derived `Debug::fmt`.
@@ -1030,6 +1277,45 @@ mod tests {
          (0xD0, 4),
          (0x162, 1)
       ]);
+   }
+
+   #[test]
+   fn arg_jump_tables_find_switches_on_a_field() {
+      let code = [
+         0x48, 0x89, 0xF3, // mov rbx, rsi
+         0x4C, 0x8D, 0x3D, 0x00, 0x01, 0x00, 0x00, // lea r15, [rip+0x100]
+         0x48, 0x8B, 0x43, 0x78, // mov rax, [rbx+0x78]
+         0x49, 0x63, 0x04, 0x87, // movsxd rax, dword [r15+rax*4]
+         0x4C, 0x01, 0xF8, // add rax, r15
+         0xFF, 0xE0, // jmp rax
+      ];
+      assert_eq!(arg_jump_tables(Abi::SysV, &code, 0x1000, 1), [(
+         0x78, 0x110A
+      )]);
+   }
+
+   #[test]
+   fn arg_field_calls_see_fields_and_copies() {
+      let code = [
+         0x48, 0x89, 0xF3, // mov rbx, rsi
+         0x48, 0x8B, 0x83, 0x08, 0x01, 0x00, 0x00, // mov rax, [rbx+0x108]
+         0x48, 0x8D, 0x94, 0x24, 0x80, 0x09, 0x00, 0x00, // lea rdx, [rsp+0x980]
+         0x48, 0x89, 0x42, 0x10, // mov [rdx+0x10], rax: not the start
+         0x0F, 0x10, 0x83, 0xF8, 0x00, 0x00, 0x00, // movups xmm0, [rbx+0xf8]
+         0x0F, 0x29, 0x02, // movaps [rdx], xmm0
+         0x48, 0x8D, 0x8B, 0xB0, 0x00, 0x00, 0x00, // lea rcx, [rbx+0xb0]
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call: rdx and rcx are gone
+      ];
+      assert_eq!(arg_field_calls(Abi::SysV, &code, 0x1000, 1), [FieldCall {
+         site: 0x1000 + 39,
+         args: [
+            None,
+            None,
+            Some(FieldArg::Copy(0xF8)),
+            Some(FieldArg::Field(0xB0))
+         ],
+      }]);
    }
 
    #[test]

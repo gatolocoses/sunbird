@@ -3571,6 +3571,55 @@ pub fn wayland_frame(image: &Image<'_>) -> Found<WaylandFrame> {
    })
 }
 
+/// The branch that skips looking up `vapostproc` for a clip pipeline, and the
+/// bytes that make it unconditional.
+#[derive(Clone, Copy, Debug)]
+pub struct VaScalerSkip {
+   pub at:    usize,
+   pub patch: &'static [u8],
+}
+
+/// The `jne` before the `vapostproc` lookup that jumps where a failed lookup
+/// goes.
+///
+/// With Mesa's radeonsi, `vapostproc` fails every frame after the first with
+/// `vaBeginPicture: invalid VASurfaceID` (build 2233), freezing the clip.
+pub fn va_scaler_lookup(image: &Image<'_>) -> Found<VaScalerSkip> {
+   if Abi::of(image) != Abi::SysV {
+      return Err("the VA scaler lookup is decoded on Linux builds only".to_owned());
+   }
+   let skips = image
+      .find_bytes(b"\0vapostproc\0")
+      .into_iter()
+      .flat_map(|text| lea_refs(image, text + 1))
+      .filter_map(|lea| {
+         let (start, end) = image.function_bounds(lea)?;
+         let lines = phoenix_hook::x86::disasm(image.read(start, end - start)?, start, usize::MAX);
+         let at = lines.iter().position(|line| line.addr == lea)?;
+         let skip = lines[at.saturating_sub(4)..at]
+            .iter()
+            .rfind(|line| line.text.starts_with("jne "))?;
+         let fails = lines[at..lines.len().min(at + 6)]
+            .iter()
+            .find(|line| line.text.starts_with("je "))?;
+         if skip.target.is_none() || skip.target != fails.target {
+            return None;
+         }
+         // `jne rel8` becomes `jmp rel8`, `jne rel32` a `nop` and `jmp rel32`.
+         let patch: &'static [u8] = match image.read(skip.addr, 2)? {
+            [0x75, _] => &[0xEB],
+            [0x0F, 0x85] => &[0x90, 0xE9],
+            _ => return None,
+         };
+         Some(VaScalerSkip {
+            at: skip.addr,
+            patch,
+         })
+      })
+      .collect::<Vec<_>>();
+   one("VA scaler lookup", &skips)
+}
+
 /// GPUI's `Zed::Window` `WndProc` checks `wParam == *(rc + disp32)` for
 /// `WM_USER+5` (`0x405`, `WM_GPUI_FORCE_UPDATE_WINDOW`), a Win32 message.
 fn window_validation(image: &Image<'_>) -> Found<usize> {

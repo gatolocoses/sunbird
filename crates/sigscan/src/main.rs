@@ -213,6 +213,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   )
                }),
             );
+            report(
+               "va scaler lookup",
+               desktop::va_scaler_lookup(image).map(|skip| at(skip.at)),
+            );
          }
          report(
             "staff flag",

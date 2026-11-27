@@ -280,10 +280,29 @@ mod linux {
       unsafe { (frame.ping)(&raw const ping) };
    }
 
+   /// Builds clip pipelines without `vapostproc`, whose frames fail on some VA
+   /// drivers and freeze the clip.
+   fn skip_va_scaler(image: &Image<'static>) {
+      let skip = match desktop::va_scaler_lookup(image) {
+         Ok(skip) => skip,
+         Err(err) => {
+            log::warn!("desktop video: {err}, clips keep vapostproc");
+            return;
+         },
+      };
+      // SAFETY: rewrites one branch to its unconditional form, from `prepare`
+      // before Discord's threads run.
+      match unsafe { image.write_code(skip.at, skip.patch) } {
+         Ok(()) => log::info!("desktop video: skipping vapostproc @ {:#x}", skip.at),
+         Err(err) => log::warn!("desktop video: {err}"),
+      }
+   }
+
    pub struct Linux;
 
    impl DesktopOs for Linux {
       fn install(image: &Image<'static>) {
+         skip_va_scaler(image);
          let found = match desktop::wayland_frame(image) {
             Ok(found) => found,
             Err(err) => {
